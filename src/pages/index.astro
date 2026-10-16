@@ -1,16 +1,22 @@
 ---
+import CardTable from '../components/CardTable';
+import '../styles/global.css';
 ---
 
+<!doctype html>
 <html lang="en">
 	<head>
 		<meta charset="utf-8" />
 		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-		<link rel="icon" href="/favicon.ico" />
 		<meta name="viewport" content="width=device-width" />
 		<meta name="generator" content={Astro.generator} />
-		<title>Astro</title>
+		<meta name="description" content="A little time well played. Play classic Solitaire or gather up to four friends for a short game of Go Fish." />
+		<meta name="theme-color" content="#234b3e" />
+		<title>Card Table — A little time well played</title>
 	</head>
 	<body>
-		<h1>Astro</h1>
+		<a class="skip-link" href="#main-content">Skip to the games</a>
+		<CardTable client:load />
+		<noscript><p class="notice">Enable JavaScript to play Solitaire and join a Go Fish table.</p></noscript>
 	</body>
 </html>
