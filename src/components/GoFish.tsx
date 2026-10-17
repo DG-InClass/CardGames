@@ -69,7 +69,7 @@ export default function GoFish({ active }: { active: boolean }) {
         if (stopped) return;
         if (session && error instanceof ApiError && [401, 404].includes(error.status)) {
           saveSession(null); setRoom(null); setError(error.message);
-        } else setConnection('Reconnecting to the table… Keep this tab open.');
+        } else setConnection(error instanceof ApiError ? error.message : 'Reconnecting to the table… Keep this tab open.');
       } finally { if (!stopped) timer = setTimeout(poll, session ? 2000 : 5000); }
     }
     void poll();

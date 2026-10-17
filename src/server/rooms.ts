@@ -1,37 +1,42 @@
-import { randomBytes, randomInt, randomUUID } from 'node:crypto';
-import { deckGateway, type DeckGateway } from '../lib/deck-api';
-import { RANKS, type Card, type Rank } from '../lib/cards';
-import { askFish, logEvent, publicHand, removeFishPlayer, startFish, type FishGame, type RoomSummary, type RoomView } from '../lib/go-fish';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { deckGateway, STOCK_PILE, type DeckGateway, type Guard } from '../lib/deck-api';
+import { assertDeck, RANKS, sortHand, type Card } from '../lib/cards';
+import { askFish, removeFishPlayers, startFish, type FishGame, type RoomSummary, type RoomView } from '../lib/go-fish';
+import type { FishAction, GoFishService } from './go-fish-service';
+import { StorageError, type RoomRepository } from './storage/room-repository';
+import { DISCONNECT_MS, ROOM_LIFETIME_MS, RoomError, type CardOperation, type RoomRecord } from './room-types';
 
-export const DISCONNECT_MS = 45_000;
-export const ROOM_LIFETIME_MS = 2 * 60 * 60 * 1000;
-const MAX_ROOMS = 100;
-export class RoomError extends Error {
-  constructor(message: string, public status = 400) { super(message); }
+export { DISCONNECT_MS, ROOM_LIFETIME_MS, RoomError } from './room-types';
+const tokenHash = (token: string) => createHash('sha256').update(token).digest('hex');
+const handPile = (id: string) => `hand_${id}`;
+const booksPile = (id: string) => `books_${id}`;
+
+function emptyGame(room: RoomRecord): FishGame {
+  return {
+    status: room.status, host: room.host, turn: room.turn, stock: [], log: [...room.log], winners: [...room.winners],
+    players: room.players.map(player => ({ id: player.id, name: player.name, hand: [], books: [] })),
+  };
 }
-type Seat = { id: string; token: string; seen: number };
-type Operation = { type: 'move'; pile: string; cards: Card[] } | { type: 'recycle'; cards: Card[]; piles: string[] };
-type Room = {
-  code: string; game: FishGame; deck?: string; version: number;
-  seats: Seat[]; pending: Operation[]; busy: boolean; syncError: boolean; expiresAt: number;
-};
-export type FishAction = { type: 'start' } | { type: 'ask'; opponent: string; rank: Rank };
-
-function shuffle(cards: Card[]) {
-  for (let i = cards.length - 1; i > 0; i--) {
-    const j = randomInt(i + 1);
-    [cards[i], cards[j]] = [cards[j], cards[i]];
+function locations(game: FishGame) {
+  const piles = new Map<string, Card[]>([[STOCK_PILE, game.stock]]);
+  for (const player of game.players) {
+    piles.set(handPile(player.id), player.hand);
+    piles.set(booksPile(player.id), player.books.flat());
   }
-  return cards;
+  return piles;
 }
 
-export class RoomStore {
-  private rooms = new Map<string, Room>();
-  constructor(private api: DeckGateway = deckGateway, private now = Date.now) {}
+export class RoomStore implements GoFishService {
+  constructor(
+    private repository: RoomRepository,
+    private api: DeckGateway = deckGateway,
+    private now = Date.now,
+  ) {}
 
-  list(): RoomSummary[] {
-    return [...this.rooms.values()].filter(room => room.game.status === 'waiting' && room.game.players.length < 4 && room.expiresAt > this.now())
-      .map(room => ({ code: room.code, host: room.game.players[0]?.name ?? 'Open table', playerCount: room.game.players.length }));
+  async list(): Promise<RoomSummary[]> {
+    return (await this.repository.list(this.now()))
+      .filter(room => room.status === 'waiting' && room.players.length < 4 && room.expiresAt > this.now())
+      .map(room => ({ code: room.code, host: room.players.find(player => player.id === room.host)?.name ?? 'Open table', playerCount: room.players.length }));
   }
 
   private name(input: unknown) {
@@ -41,161 +46,251 @@ export class RoomStore {
     return input.trim();
   }
 
-  create(input: unknown) {
+  async create(input: unknown) {
     const name = this.name(input);
-    if (this.rooms.size >= MAX_ROOMS) throw new RoomError('All tables are busy. Try again later.', 503);
-    let code: string;
-    do { code = randomBytes(4).toString('hex').slice(0, 6).toUpperCase(); } while (this.rooms.has(code));
-    const id = randomUUID();
-    const seat = { id, token: randomUUID(), seen: this.now() };
-    const room: Room = {
-      code, version: 0, seats: [seat], pending: [], busy: false, syncError: false,
-      expiresAt: this.now() + ROOM_LIFETIME_MS,
-      game: { status: 'waiting', players: [{ id, name, hand: [], books: [] }], stock: [], host: id, turn: null, log: [`${name} opened the table.`], winners: [] },
-    };
-    this.rooms.set(code, room);
-    return { token: seat.token, room: this.view(room, id) };
+    // Reclaim one abandoned room before capacity checks; never wait for a timer.
+    await this.sweep(1);
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const code = randomBytes(3).toString('hex').toUpperCase();
+      const id = randomUUID(); const token = randomUUID();
+      const room: RoomRecord = {
+        code, version: 0, pending: [], syncError: false, expiresAt: this.now() + ROOM_LIFETIME_MS,
+        status: 'waiting', players: [{ id, name, tokenHash: tokenHash(token), books: [] }],
+        host: id, turn: null, log: [`${name} opened the table.`], winners: [],
+      };
+      if (await this.repository.create(room, this.now())) return { token, room: await this.view(room, id) };
+    }
+    throw new RoomError('Could not allocate a table code. Please try again.', 503);
   }
 
-  join(code: string, input: unknown) {
-    const room = this.room(code);
-    const name = this.name(input);
-    if (room.busy || room.game.status !== 'waiting') throw new RoomError('This game has already started.', 409);
-    if (room.game.players.length >= 4) throw new RoomError('This table is full (four players maximum).', 409);
-    if (room.game.players.some(player => player.name.toLowerCase() === name.toLowerCase())) throw new RoomError('That name is taken at this table. Choose another.');
-    const seat = { id: randomUUID(), token: randomUUID(), seen: this.now() };
-    room.seats.push(seat);
-    room.game.players.push({ id: seat.id, name, hand: [], books: [] });
-    room.version++;
-    logEvent(room.game, `${name} joined the table.`);
-    return { token: seat.token, room: this.view(room, seat.id) };
-  }
-
-  private room(code: string) {
-    const room = this.rooms.get(code.toUpperCase());
-    if (!room || room.expiresAt <= this.now()) throw new RoomError('This table has expired. Join or create another.', 404);
+  private async read(code: string) {
+    const room = await this.repository.read(code.toUpperCase());
+    if (!room) throw new RoomError('This table has expired. Join or create another.', 404);
     return room;
   }
-
-  private seat(room: Room, token: string) {
-    const seat = room.seats.find(person => person.token === token);
-    if (!seat || this.now() - seat.seen > DISCONNECT_MS) throw new RoomError('Your seat expired. Your cards are being returned to the deck.', 401);
-    seat.seen = this.now();
+  private member(room: RoomRecord, token: string) {
+    const seat = room.players.find(player => player.tokenHash === tokenHash(token));
+    if (!seat) throw new RoomError('Your seat expired. Your cards are being returned to the deck.', 401);
+    return seat;
+  }
+  private async heartbeat(room: RoomRecord, token: string) {
+    const seat = this.member(room, token);
+    if (!await this.repository.heartbeat(room.code, seat.id, this.now())) {
+      await this.maintain(room.code).catch(() => {});
+      throw new RoomError('Your seat expired. Your cards are being returned to the deck.', 401);
+    }
     return seat;
   }
 
-  get(code: string, token: string) {
-    const room = this.room(code);
-    return this.view(room, this.seat(room, token).id);
+  private async locked<T>(code: string, work: (room: RoomRecord, owner: string, guard: Guard) => Promise<T>, requestDeadline = Infinity): Promise<T> {
+    code = code.toUpperCase();
+    const owner = randomUUID();
+    if (!await this.repository.acquire(code, owner)) throw new RoomError('The table is updating. Please try again in a moment.', 409);
+    const deadline = Math.min(Date.now() + 30_000, requestDeadline);
+    const guard: Guard = async () => {
+      if (Date.now() >= deadline) throw new RoomError('This move will continue on the next table update.', 409);
+      if (!await this.repository.owns(code, owner)) throw new RoomError('The table lock expired. Refresh before making another move.', 409);
+    };
+    try { return await work(await this.read(code), owner, guard); }
+    finally { await this.repository.release(code, owner).catch(() => {}); }
   }
 
-  private view(room: Room, id: string): RoomView {
+  async join(code: string, input: unknown) {
+    const name = this.name(input);
+    return this.locked(code, async (room, owner, guard) => {
+      await this.cleanup(room, owner, guard);
+      this.checkExpiry(room);
+      if (room.pending.length || room.status !== 'waiting') throw new RoomError('This game has already started.', 409);
+      if (room.players.length >= 4) throw new RoomError('This table is full (four players maximum).', 409);
+      if (room.players.some(player => player.name.toLowerCase() === name.toLowerCase())) throw new RoomError('That name is taken at this table. Choose another.');
+      const id = randomUUID(); const token = randomUUID();
+      room.players.push({ id, name, tokenHash: tokenHash(token), books: [] });
+      room.log = [`${name} joined the table.`, ...room.log].slice(0, 16);
+      room.version++;
+      await this.repository.save(room, owner, this.now());
+      return { token, room: await this.view(room, id) };
+    });
+  }
+
+  private checkExpiry(room: RoomRecord) {
+    if (room.expiresAt <= this.now() || !room.players.length) throw new RoomError('This table has expired. Join or create another.', 404);
+  }
+
+  async get(code: string, token: string) {
+    await this.heartbeat(await this.read(code), token);
+    // Read under the same lock as moves so metadata and remote piles agree.
+    return this.locked(code, async (room, owner, guard) => {
+      await this.cleanup(room, owner, guard);
+      this.checkExpiry(room);
+      return this.view(room, this.member(room, token).id);
+    });
+  }
+
+  private async view(room: RoomRecord, id: string): Promise<RoomView> {
+    const presence = await this.repository.presence(room.code);
+    // Never expose a partially applied set of piles while a transaction recovers.
+    const stock = room.deck && !room.pending.length ? await this.api.pile(room.deck, STOCK_PILE) : null;
+    const hand = stock?.counts[handPile(id)] ? await this.api.pile(room.deck!, handPile(id)) : null;
     return {
-      code: room.code, version: room.version, status: room.game.status, host: room.game.host, turn: room.game.turn,
-      players: room.game.players.map(player => ({
-        id: player.id, name: player.name, cardCount: player.hand.length,
-        books: player.books.map(book => book[0].value),
-        reconnecting: this.now() - (room.seats.find(seat => seat.id === player.id)?.seen ?? 0) > 15_000,
+      code: room.code, version: room.version, status: room.status, host: room.host, turn: room.turn,
+      players: room.players.map(player => ({ id: player.id, name: player.name,
+        cardCount: stock?.counts[handPile(player.id)] ?? 0, books: [...player.books],
+        reconnecting: this.now() - (presence[player.id] ?? 0) > 15_000,
       })),
-      you: id, hand: publicHand(room.game, id), stockCount: room.game.stock.length,
-      log: [...room.game.log], winners: [...room.game.winners], syncing: room.busy || room.pending.length > 0,
+      you: id, hand: sortHand(hand?.cards ?? []), stockCount: stock?.counts[STOCK_PILE] ?? 0,
+      log: [...room.log], winners: [...room.winners], syncing: room.pending.length > 0,
       syncError: room.syncError, expiresAt: room.expiresAt,
     };
   }
 
-  private queueChanges(room: Room, previous: FishGame, returned: Card[] = []) {
-    if (!room.deck) return;
-    const owners = new Map<string, string>();
-    for (const player of previous.players) {
-      player.hand.forEach(card => owners.set(card.code, `hand_${player.id}`));
-      player.books.flat().forEach(card => owners.set(card.code, `books_${player.id}`));
-    }
-    if (returned.length) room.pending.push({
-      type: 'recycle', cards: returned,
-      piles: [...new Set(returned.map(card => owners.get(card.code)).filter((pile): pile is string => Boolean(pile)))],
-    });
-    for (const player of room.game.players) {
-      for (const [pile, cards] of [[`hand_${player.id}`, player.hand], [`books_${player.id}`, player.books.flat()]] as const) {
-        const moved = cards.filter(card => owners.get(card.code) !== pile);
-        if (moved.length) room.pending.push({ type: 'move', pile, cards: moved });
-      }
-    }
+  private async snapshot(room: RoomRecord): Promise<FishGame> {
+    const game = emptyGame(room);
+    if (!room.deck) return game;
+    const stock = await this.api.pile(room.deck, STOCK_PILE);
+    game.stock = stock.cards;
+    await Promise.all(game.players.map(async player => {
+      player.hand = stock.counts[handPile(player.id)] ? (await this.api.pile(room.deck!, handPile(player.id))).cards : [];
+      const books = stock.counts[booksPile(player.id)] ? (await this.api.pile(room.deck!, booksPile(player.id))).cards : [];
+      player.books = RANKS.map(rank => books.filter(card => card.value === rank)).filter(book => book.length);
+      if (player.books.some(book => book.length !== 4)) throw new RoomError('The card service returned an incomplete book. The table is paused.', 503);
+    }));
+    // The stock pile + every hand and book must partition a standard deck.
+    assertDeck([...game.stock, ...game.players.flatMap(player => [...player.hand, ...player.books.flat()])]);
+    return game;
   }
 
-  private async flush(room: Room) {
-    room.busy = true;
+  private async install(room: RoomRecord, previous: FishGame, next: FishGame, owner: string, returned: Card[] = []) {
+    const operations: CardOperation[] = [];
+    const owners = new Map<string, string>();
+    for (const [pile, cards] of locations(previous)) cards.forEach(card => owners.set(card.code, pile));
+    if (returned.length) {
+      const codes = returned.map(card => card.code);
+      for (const pile of new Set(codes.map(code => owners.get(code)!))) {
+        operations.push({ type: 'return', pile, codes: codes.filter(code => owners.get(code) === pile) });
+      }
+      operations.push({ type: 'restore-stock', codes });
+    }
+    for (const [pile, cards] of locations(next)) {
+      // restore-stock already puts departed players' cards into the stock pile.
+      const codes = cards.filter(card => owners.get(card.code) !== pile && !(pile === STOCK_PILE && returned.some(value => value.code === card.code))).map(card => card.code);
+      if (codes.length) operations.push({ type: 'move', pile, codes });
+    }
+    if (returned.length && next.stock.length) operations.push({ type: 'shuffle' });
+    room.status = next.status; room.host = next.host; room.turn = next.turn;
+    room.log = next.log; room.winners = next.winners;
+    room.players = next.players.map(player => ({ ...room.players.find(person => person.id === player.id)!, books: player.books.map(book => book[0].value) }));
+    room.pending = operations; room.syncError = false; room.version++;
+    // Save the intended move BEFORE touching any remote pile. A new function
+    // invocation can replay these idempotent operations after a crash.
+    await this.repository.save(room, owner, this.now());
+  }
+
+  private async flush(room: RoomRecord, owner: string, guard: Guard) {
     try {
       while (room.pending.length && room.deck) {
+        await guard();
         const operation = room.pending[0];
-        if (operation.type === 'recycle') await this.api.recycle(room.deck, operation.cards, operation.piles);
-        else await this.api.move(room.deck, operation.pile, operation.cards);
-        room.pending.shift();
+        if (operation.type === 'move') await this.api.move(room.deck, operation.pile, operation.codes, guard);
+        else if (operation.type === 'return') await this.api.returnPile(room.deck, operation.pile, operation.codes, guard);
+        else if (operation.type === 'restore-stock') await this.api.restoreStock(room.deck, operation.codes, guard);
+        else await this.api.shuffleStock(room.deck, guard);
+        const next = { ...room, pending: room.pending.slice(1), syncError: false };
+        await this.repository.save(next, owner, this.now());
+        Object.assign(room, next);
       }
-      room.syncError = false;
     } catch {
-      // Retain the operation and pause new moves. The sweeper retries it.
-      // Cards and scores remain authoritative here, never in browser state.
       room.syncError = true;
-    } finally { room.busy = false; }
+      await this.repository.save(room, owner, this.now());
+    }
   }
 
   async action(code: string, token: string, version: number, action: FishAction) {
-    const room = this.room(code);
-    const seat = this.seat(room, token);
-    if (room.busy || room.pending.length) throw new RoomError('The deck is syncing. Please wait a moment.', 409);
-    if (room.version !== version) throw new RoomError('The table changed. Review the latest cards and try again.', 409);
-    if (action.type === 'start') {
-      if (seat.id !== room.game.host) throw new RoomError('Only the host can deal.', 403);
-      if (room.game.status !== 'waiting' || room.game.players.length < 2) throw new RoomError('Wait for at least two players.');
-      room.busy = true;
-      try {
-        const deck = await this.api.create();
+    await this.heartbeat(await this.read(code), token);
+    return this.locked(code, async (room, owner, guard) => {
+      await this.cleanup(room, owner, guard);
+      this.checkExpiry(room);
+      const seat = this.member(room, token);
+      if (room.pending.length) throw new RoomError('The deck is syncing. Please wait a moment.', 409);
+      if (room.version !== version) throw new RoomError('The table changed. Review the latest cards and try again.', 409);
+      const previous = await this.snapshot(room);
+      const next = structuredClone(previous);
+      if (action.type === 'start') {
+        if (seat.id !== room.host) throw new RoomError('Only the host can deal.', 403);
+        if (room.status !== 'waiting' || room.players.length < 2) throw new RoomError('Wait for at least two players.');
+        const deck = await this.api.create(guard);
+        assertDeck(deck.cards);
         room.deck = deck.id;
-        const previous = structuredClone(room.game);
-        startFish(room.game, deck.cards);
-        room.version++;
-        this.queueChanges(room, previous);
-      } finally { room.busy = false; }
-    } else {
-      if (!RANKS.includes(action.rank)) throw new RoomError('Choose a valid rank.');
-      const previous = structuredClone(room.game);
-      try { askFish(room.game, seat.id, action.opponent, action.rank); }
-      catch (error) { throw new RoomError((error as Error).message); }
-      room.version++;
-      this.queueChanges(room, previous);
-    }
-    await this.flush(room);
-    return this.view(room, seat.id);
+        startFish(next, deck.cards);
+      } else {
+        if (!RANKS.includes(action.rank)) throw new RoomError('Choose a valid rank.');
+        try { askFish(next, seat.id, action.opponent, action.rank); }
+        catch (error) { throw new RoomError((error as Error).message); }
+      }
+      await this.install(room, previous, next, owner);
+      await this.flush(room, owner, guard);
+      return this.view(room, seat.id);
+    });
   }
 
   async leave(code: string, token: string) {
-    const room = this.room(code);
-    const seat = this.seat(room, token);
-    // Expire immediately even if an external operation is still running.
-    seat.seen = -Infinity;
-    await this.sweep();
+    await this.heartbeat(await this.read(code), token);
+    await this.locked(code, async (room, owner, guard) => {
+      const seat = this.member(room, token);
+      await this.flush(room, owner, guard);
+      if (room.pending.length) throw new RoomError('The deck is recovering. Try leaving again shortly.', 503);
+      await this.drop(room, [seat.id], owner, guard);
+    });
   }
 
-  async sweep() {
-    await Promise.all([...this.rooms.values()].map(async room => {
-      if (room.busy) return;
-      // Expiring a room also returns every player's hand and books.
-      const expired = room.expiresAt <= this.now();
-      for (const seat of [...room.seats]) {
-        if (!expired && this.now() - seat.seen <= DISCONNECT_MS) continue;
-        const previous = structuredClone(room.game);
-        const returned = removeFishPlayer(room.game, seat.id, shuffle);
-        room.seats = room.seats.filter(person => person.id !== seat.id);
-        room.version++;
-        this.queueChanges(room, previous, returned);
+  private async drop(room: RoomRecord, ids: string[], owner: string, guard: Guard) {
+    const previous = await this.snapshot(room);
+    const next = structuredClone(previous);
+    // Return all departing players together before refilling anyone's hand.
+    // This prevents an expired player's cards from being dealt to another
+    // departing player halfway through cleanup.
+    const returned = removeFishPlayers(next, ids, cards => cards);
+    await this.install(room, previous, next, owner, returned);
+    await this.flush(room, owner, guard);
+    if (!room.players.length && !room.pending.length) await this.repository.remove(room.code, owner);
+  }
+
+  private async cleanup(room: RoomRecord, owner: string, guard: Guard) {
+    await this.flush(room, owner, guard);
+    if (room.pending.length) return;
+    const presence = await this.repository.presence(room.code);
+    const ids = room.players.filter(player => room.expiresAt <= this.now() || this.now() - (presence[player.id] ?? 0) > DISCONNECT_MS).map(player => player.id);
+    if (ids.length) await this.drop(room, ids, owner, guard);
+    else if (!room.players.length) await this.repository.remove(room.code, owner);
+  }
+
+  private async maintain(code: string, deadline = Infinity) {
+    return this.locked(code, (room, owner, guard) => this.cleanup(room, owner, guard), deadline);
+  }
+
+  async sweep(limit = 100) {
+    const due = (await this.repository.due(this.now())).slice(0, limit);
+    const deadline = Date.now() + 25_000;
+    let processed = 0;
+    let failed = 0;
+    // Bounded invocation; unfinished rooms remain indexed for the next request.
+    for (const code of due) {
+      if (Date.now() >= deadline) break;
+      try {
+        const exists = await this.repository.read(code);
+        if (exists) await this.maintain(code, deadline);
+        else {
+          const owner = randomUUID();
+          if (await this.repository.acquire(code, owner)) {
+            try { await this.repository.remove(code, owner); }
+            finally { await this.repository.release(code, owner); }
+          }
+        }
+        processed++;
+      } catch (error) {
+        // An unavailable/expired external deck must not block other rooms.
+        if (!(error instanceof RoomError && error.status === 409) && !(error instanceof StorageError && error.code === 'conflict')) failed++;
       }
-      if (room.pending.length) await this.flush(room);
-      if (!room.seats.length && !room.pending.length) this.rooms.delete(room.code);
-    }));
+    }
+    return { processed, ...(failed ? { failed } : {}) };
   }
 }
-
-// One store per Node process, shared by requests and retained across Vite HMR.
-const globals = globalThis as typeof globalThis & { cardRooms?: RoomStore; cardRoomsTimer?: ReturnType<typeof setInterval> };
-export const rooms = globals.cardRooms ??= new RoomStore();
-globals.cardRoomsTimer ??= setInterval(() => { void rooms.sweep().catch(console.error); }, 5000).unref();

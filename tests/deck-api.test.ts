@@ -1,37 +1,57 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { deckGateway } from '../src/lib/deck-api';
+import { deck } from './helpers';
 import type { Card } from '../src/lib/cards';
 
-test('Disconnect returns both named piles and safely recovers a lost draw response', async () => {
+test('Returns recover lost draw and pile-add responses without duplicating cards', async () => {
   const originalFetch = globalThis.fetch;
-  const cards: Card[] = [
-    { code: 'AS', value: 'ACE', suit: 'SPADES', image: '' },
-    { code: 'AH', value: 'ACE', suit: 'HEARTS', image: '' },
-    { code: 'AC', value: 'ACE', suit: 'CLUBS', image: '' },
-  ];
-  const piles: Record<string, Card[]> = { hand: [cards[0]], books: cards.slice(1) };
-  let stock: Card[] = []; let drawn: Card[] = []; let loseResponse = true;
-  const calls: string[] = [];
-  globalThis.fetch = async input => {
-    const path = new URL(String(input)).pathname; calls.push(path);
-    const pile = path.match(/pile\/(\w+)\/return/);
-    if (pile) { stock.push(...piles[pile[1]]); piles[pile[1]] = []; }
-    else if (path.endsWith('/return/')) { stock.push(...drawn); drawn = []; }
-    else if (path.endsWith('/draw/')) {
-      assert.equal(stock.length, 3);
-      drawn = stock; stock = [];
-      if (loseResponse) { loseResponse = false; throw new Error('Response lost after the draw succeeded'); }
-      return Response.json({ success: true, cards: drawn, remaining: 0 });
-    } else throw new Error(`Unexpected request: ${path}`);
-    return Response.json({ success: true, remaining: stock.length });
-  };
+  for (const loseAt of ['draw', 'add']) {
+    const cards = deck.slice(0, 3);
+    const codes = cards.map(card => card.code);
+    const piles: Record<string, Card[]> = { hand: [cards[0]], books: cards.slice(1), stock: [] };
+    let main: Card[] = []; let drawn: Card[] = []; let loseResponse = true;
+    const calls: string[] = [];
+    globalThis.fetch = async input => {
+      const url = new URL(String(input)); const path = url.pathname; calls.push(path);
+      assert.equal(url.hostname, 'www.deckofcardsapi.com');
+      assert.deepEqual(url.searchParams.get('cards')?.split(',') ?? codes, path.includes('/hand/') ? [codes[0]] : path.includes('/books/') ? codes.slice(1) : codes);
+      const pileReturn = path.match(/pile\/(\w+)\/return/);
+      if (pileReturn) {
+        const name = pileReturn[1]; const selected = url.searchParams.get('cards')!.split(',');
+        main.push(...piles[name].filter(card => selected.includes(card.code)));
+        piles[name] = piles[name].filter(card => !selected.includes(card.code));
+      } else if (path.endsWith('/return/')) { main.push(...drawn); drawn = []; }
+      else if (path.endsWith('/draw/')) {
+        assert.equal(main.length, 3); drawn = main; main = [];
+        if (loseAt === 'draw' && loseResponse) { loseResponse = false; throw new Error('Response lost'); }
+        return Response.json({ success: true, cards: drawn, remaining: 0 });
+      } else if (path.endsWith('/stock/add/')) {
+        piles.stock.push(...drawn); drawn = [];
+        if (loseAt === 'add' && loseResponse) { loseResponse = false; throw new Error('Response lost'); }
+      } else throw new Error(`Unexpected request: ${path}`);
+      return Response.json({ success: true, remaining: main.length });
+    };
+    try {
+      await deckGateway.returnPile('test', 'hand', [codes[0]]);
+      await deckGateway.returnPile('test', 'books', codes.slice(1));
+      await assert.rejects(deckGateway.restoreStock('test', codes), /Response lost/);
+      await deckGateway.restoreStock('test', codes);
+      assert.deepEqual(piles.hand, []); assert.deepEqual(piles.books, []);
+      assert.deepEqual(piles.stock.map(card => card.code), codes);
+      assert.equal(main.length + drawn.length, 0);
+      assert.equal(calls.filter(path => path.endsWith('/pile/stock/return/')).length, 2);
+    } finally { globalThis.fetch = originalFetch; }
+  }
+});
+
+test('API pile listing preserves card order and normalizes counts; mutations check the lock', async () => {
+  const originalFetch = globalThis.fetch; let calls = 0;
+  globalThis.fetch = async () => { calls++; return Response.json({ success: true, remaining: 0, piles: { stock: { cards: deck.slice(0, 3), remaining: '3' }, hand_a: { remaining: '7' } } }); };
   try {
-    await assert.rejects(deckGateway.recycle('test', cards, ['hand', 'books']), /Response lost/);
-    await deckGateway.recycle('test', cards, ['hand', 'books']);
-    assert.deepEqual(piles, { hand: [], books: [] });
-    assert.equal(drawn.length, 3); assert.equal(new Set(drawn.map(card => card.code)).size, 3);
-    assert.equal(calls.filter(path => path.endsWith('/pile/hand/return/')).length, 2);
-    assert.equal(calls.filter(path => path.endsWith('/pile/books/return/')).length, 2);
+    const snapshot = await deckGateway.pile('test', 'stock');
+    assert.deepEqual(snapshot.cards, deck.slice(0, 3)); assert.deepEqual(snapshot.counts, { stock: 3, hand_a: 7 });
+    await assert.rejects(deckGateway.move('test', 'hand_a', ['AS'], async () => { throw new Error('Lock lost'); }), /Lock lost/);
+    assert.equal(calls, 1);
   } finally { globalThis.fetch = originalFetch; }
 });

@@ -96,14 +96,21 @@ export function askFish(game: FishGame, playerId: string, opponentId: string, ra
 }
 
 export function removeFishPlayer(game: FishGame, id: string, shuffle: (cards: Card[]) => Card[]): Card[] {
-  const index = game.players.findIndex(player => player.id === id);
-  if (index === -1) return [];
-  const player = game.players[index];
-  const returned = [...player.hand, ...player.books.flat()];
+  return removeFishPlayers(game, [id], shuffle);
+}
+
+export function removeFishPlayers(game: FishGame, ids: string[], shuffle: (cards: Card[]) => Card[]): Card[] {
+  const departing = game.players.filter(player => ids.includes(player.id));
+  if (!departing.length) return [];
+  // Choose the next surviving player in the original seating order.
+  const turnIndex = Math.max(0, game.players.findIndex(player => player.id === game.turn));
+  const nextTurn = [...game.players.slice(turnIndex), ...game.players.slice(0, turnIndex)]
+    .find(player => !ids.includes(player.id))?.id;
+  const returned = departing.flatMap(player => [...player.hand, ...player.books.flat()]);
   game.stock = shuffle([...game.stock, ...returned]);
-  game.players.splice(index, 1);
-  logEvent(game, `${player.name} left. ${returned.length} cards returned to the pond, including their books.`);
-  if (game.host === id) game.host = game.players[0]?.id ?? '';
+  game.players = game.players.filter(player => !ids.includes(player.id));
+  logEvent(game, `${departing.map(player => player.name).join(', ')} left. ${returned.length} cards returned to the pond, including their books.`);
+  if (ids.includes(game.host)) game.host = game.players[0]?.id ?? '';
   if (game.status === 'playing') {
     if (game.players.length < 2) {
       game.status = 'cancelled';
@@ -111,8 +118,7 @@ export function removeFishPlayer(game: FishGame, id: string, shuffle: (cards: Ca
       logEvent(game, 'The game ended because fewer than two players remain.');
     } else {
       game.players.forEach(person => refill(game, person));
-      const current = game.players.findIndex(person => person.id === game.turn);
-      finishOrAdvance(game, current >= 0 ? current : index % game.players.length);
+      finishOrAdvance(game, Math.max(0, game.players.findIndex(person => person.id === nextTurn)));
     }
   }
   return returned;

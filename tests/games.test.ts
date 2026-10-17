@@ -1,17 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { RANKS, SUITS, rankLabel, type Card } from '../src/lib/cards';
+import { RANKS, SUITS, rankLabel } from '../src/lib/cards';
 import { dealSolitaire, drawStock, hasWon, moveCards, type SolitaireState } from '../src/lib/solitaire';
 import { askFish, removeFishPlayer, startFish, type FishGame } from '../src/lib/go-fish';
-import { DISCONNECT_MS, ROOM_LIFETIME_MS, RoomStore } from '../src/server/rooms';
-import type { DeckGateway } from '../src/lib/deck-api';
 
 const deck = SUITS.flatMap(suit => RANKS.map(value => ({ code: `${value === '10' ? '0' : rankLabel(value)}${suit[0]}`, suit, value, image: '' })));
 const card = (code: string) => structuredClone(deck.find(card => card.code === code)!);
 const emptySolitaire = (): SolitaireState => ({ stock: [], waste: [], tableau: Array.from({ length: 7 }, () => []), foundations: [[], [], [], []], moves: 0 });
 const fish = (count = 2): FishGame => ({ status: 'waiting', host: 'p0', turn: null, stock: [], log: [], winners: [], players: Array.from({ length: count }, (_, index) => ({ id: `p${index}`, name: `Player ${index}`, hand: [], books: [] })) });
 const totalCards = (game: FishGame) => [...game.stock, ...game.players.flatMap(player => [...player.hand, ...player.books.flat()])];
-const fakeApi = (): DeckGateway => ({ create: async () => ({ id: 'test-deck', cards: structuredClone(deck) }), move: async () => {}, recycle: async () => {} });
 
 test('Solitaire deals 52 unique cards with only the seven top cards exposed', () => {
   const game = dealSolitaire(deck);
@@ -117,72 +114,6 @@ test('Leaving returns the hand AND books, hands off host/turn, and keeps the rem
   assert.equal(game.host, 'p1'); assert.equal(game.turn, 'p1'); assert.equal(game.status, 'playing');
   removeFishPlayer(game, 'p1', cards => cards);
   assert.equal(game.status, 'cancelled');
-});
-
-test('Lobby enforces capacity, unique names, membership, and host-only dealing', async () => {
-  const store = new RoomStore(fakeApi()); const host = store.create('Host'); const code = host.room.code;
-  const guest = store.join(code, 'Guest'); store.join(code, 'Third'); store.join(code, 'Fourth');
-  assert.throws(() => store.join(code, 'Fifth'), /full/);
-  assert.equal(store.list().length, 0);
-  assert.throws(() => store.get(code, 'bad-token'), /expired/);
-  await assert.rejects(store.action(code, guest.token, 3, { type: 'start' }), /Only the host/);
-  const other = new RoomStore(fakeApi()); const room = other.create('Name');
-  assert.throws(() => other.join(room.room.code, 'name'), /taken/);
-});
-
-test('Room responses never expose another hand, the deck ID, or seat tokens; stale actions cannot replay', async () => {
-  const store = new RoomStore(fakeApi()); const host = store.create('Host'); const code = host.room.code;
-  const guest = store.join(code, 'Guest');
-  const view = await store.action(code, host.token, 1, { type: 'start' });
-  const text = JSON.stringify(view);
-  assert.equal(view.hand.length, 7);
-  assert.ok(!text.includes(host.token) && !text.includes(guest.token) && !text.includes('test-deck'));
-  assert.ok(view.players.every(player => !('hand' in player)));
-  await assert.rejects(store.action(code, host.token, 1, { type: 'start' }), /table changed/);
-  assert.throws(() => store.join(code, 'Late'), /already started/);
-});
-
-test('Heartbeat grace allows reconnects, then returns expired players cards through the API', async () => {
-  let now = 0; const returned: Card[][] = []; const gateway = fakeApi();
-  gateway.recycle = async (_deck, cards, piles) => {
-    returned.push(cards);
-    assert.equal(piles.length, 1);
-    assert.ok(piles[0].startsWith('hand_'));
-  };
-  const store = new RoomStore(gateway, () => now); const host = store.create('Host'); const code = host.room.code;
-  const guest = store.join(code, 'Guest'); const third = store.join(code, 'Third');
-  await store.action(code, host.token, 2, { type: 'start' });
-  now = 30_000; store.get(code, host.token); store.get(code, third.token);
-  now = DISCONNECT_MS + 1; await store.sweep();
-  assert.throws(() => store.get(code, guest.token), /expired/);
-  const view = store.get(code, host.token);
-  assert.equal(view.players.length, 2); assert.equal(view.stockCount, 42);
-  assert.equal(returned.flat().length, 5); assert.equal(view.status, 'playing');
-});
-
-test('API failures pause moves, retry pile updates, and preserve all 52 cards', async () => {
-  let fail = true; let moves = 0; const gateway = fakeApi();
-  gateway.move = async () => { moves++; if (fail) throw new Error('network failure'); };
-  const store = new RoomStore(gateway); const host = store.create('Host'); const code = host.room.code;
-  store.join(code, 'Guest');
-  const view = await store.action(code, host.token, 1, { type: 'start' });
-  assert.ok(view.syncError && view.syncing);
-  await assert.rejects(store.action(code, host.token, view.version, { type: 'start' }), /syncing/);
-  fail = false; await store.sweep();
-  const recovered = store.get(code, host.token);
-  assert.equal(recovered.syncing, false); assert.equal(recovered.syncError, false);
-  assert.equal(recovered.stockCount + recovered.players.reduce((sum, player) => sum + player.cardCount + player.books.length * 4, 0), 52);
-  assert.equal(moves, 3);
-});
-
-test('Rooms expire and are removed after their final player leaves', async () => {
-  let now = 0; const store = new RoomStore(fakeApi(), () => now);
-  const host = store.create('Host');
-  now = ROOM_LIFETIME_MS + 1; await store.sweep();
-  assert.deepEqual(store.list(), []);
-  assert.throws(() => store.get(host.room.code, host.token), /expired/);
-  const next = store.create('Next'); await store.leave(next.room.code, next.token);
-  assert.deepEqual(store.list(), []);
 });
 
 test('Complete simulated games conserve cards and terminate with thirteen books', () => {

@@ -1,0 +1,5 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "astro",
+  "crons": [{ "path": "/api/gofish-cleanup", "schedule": "0 0 * * *" }]
+}
